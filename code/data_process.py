@@ -20,12 +20,12 @@ UNK_IDX = 1
 SOS_IDX = 2
 EOS_IDX = 3
 
-def getToken(path, iszh = False):
+def getToken(path, language):
     out = []
     i = 0
     with open(path) as inputfile:
         for line in inputfile:
-            if (iszh == False) | (i%2 ==0):
+            if (language != 'zh') | (i%2 ==0):
                 out.append(line.strip().lower().split(' '))
             i+=1
     return out
@@ -108,9 +108,10 @@ if __name__ == '__main__':
 
     print('Loading data')
     emb, embedding_dim = load_vectors(args.embFile, num_vecs=args.emb_size_limit)
-    train = getToken(args.inputPath + 'train.tok.' + args.language)
-    dev = getToken(args.inputPath + 'dev.tok.' + args.language)
-    test = getToken(args.inputPath + 'test.tok.' + args.language)
+    train = getToken(args.inputPath + 'train.tok.' + args.language, args.language)
+    dev = getToken(args.inputPath + 'dev.tok.' + args.language, args.language)
+    test = getToken(args.inputPath + 'test.tok.' + args.language, args.language)
+    print('Data size: train - %d, dev - %d, test - %d'%(len(train), len(dev), len(test)))
 
     print('Creating/loading data dictionary')
     if args.counterFile is not None:
