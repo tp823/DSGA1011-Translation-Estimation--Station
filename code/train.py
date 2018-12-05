@@ -67,6 +67,8 @@ if __name__ == '__main__':
     flg_cuda = torch.cuda.is_available()
     torch.manual_seed(args.randSeed)
 
+    print('General parameters: ', args)
+
     print('Load data: ')
     if not args.flgNoPretrain:
         data_emb = pickle.load(open(args.inputPath + 'embeddings_' + args.dataLang + '.p', 'rb'))
@@ -109,11 +111,12 @@ if __name__ == '__main__':
     elif args.optType == 'SGD':
         opt = optim.SGD(model.params, lr=args.lr)
 
-    print("Beginning Training")
+
     train_paras = {'n_iter': args.n_iter, 'log_interval': [args.logInterval, 1000],
                    'lr_decay': [args.lr, args.lr_decay_rate, args.lr_decay3, 1e-5],
                    'flgSave': args.flgSave, 'savePath': args.savePath, 'n_batch': args.n_batch, 'randSeed': args.randSeed}
 
+    print("Beginning Training")
     m = m.trainModel(train_paras, train_loader, test_loader, model, opt, dict_target['id2token'])
 
     start = time.time()
