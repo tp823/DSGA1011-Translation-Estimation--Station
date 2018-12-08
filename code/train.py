@@ -97,7 +97,7 @@ if __name__ == '__main__':
 
     model_paras = {'emb_dim_enc': args.emb_dim_data, 'emb_dim_dec': args.emb_dim_target, 'vocab_size_enc': args.vocab_size_data, 'vocab_size_dec': args.vocab_size_target,
                    'teacher_forcing_ratio': args.teacher_forcing_ratio, 'dimLSTM_enc': args.dimLSTM_enc, 'dimLSTM_dec': args.dimLSTM_dec, 'nLSTM_enc': args.nLSTM_enc,
-                   'flg_bidirectional_enc': args.flg_bidirectional_enc, 'flg_updateEmb': args.flg_updateEmb}
+                   'flg_bidirectional_enc': args.flg_bidirectional_enc, 'flg_updateEmb': args.flg_updateEmb, 'p_dropOut': args.p_dropOut}
 
     model = getattr(m, args.modelName)(model_paras, data_emb, target_emb)
 
