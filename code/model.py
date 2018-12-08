@@ -195,6 +195,8 @@ class RNNseq2seq(nn.Module):
                 for j in range(max_length):
                     if decoder_idx[i][j].item() == EOS_IDX:
                         mask[i,j:] = 0
+        if self.flg_cuda:
+            mask = mask.cuda()
         return decoder_output, decoder_idx, mask
 
     def inference(self, data, target, data_len, target_len):
