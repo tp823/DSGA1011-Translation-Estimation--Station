@@ -13,6 +13,8 @@ from torch.utils.data import Dataset
 import random
 import sacrebleu
 import pdb
+import math
+import copy
 
 # Global Variables
 PAD_IDX = 0
@@ -85,10 +87,10 @@ class EncoderRNN(nn.Module):
             h0 = self.init_hidden(batchSize, 1)
 
         output = self.dropout(embedded)
-        output, hidden = self.gru(output, h0)
+        output, hidden = self.gru(output, h0) # output.shape: batch x seq_len x dimLSTM(x2 if bi), hidden.shape: 1(2 if bi) x batch x dimLSTM
 
         if self.flg_bidirectional:
-            hidden = torch.cat([hidden[0], hidden[1]], 2)
+            hidden = torch.cat([hidden[0], hidden[1]], 1).view(1, batchSize, -1)
         return output, hidden.transpose(0,1)
 
     def init_hidden(self, batchSize, nlayers):
@@ -177,6 +179,376 @@ class RNNseq2seq(nn.Module):
 
         if use_teacher_forcing:
             decoder_input = torch.cat([decoder_input, target[:,0:-1]], 1) # All inputs known, don't need to iterate
+            encoder_hidden_seq = encoder_hidden.repeat(1, max_length, 1) # Repeated encoder last hidden layer as the context vector
+            decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden, encoder_hidden_seq)
+
+        else:
+            decoder_output = torch.zeros(batchSize, max_length, self.vocab_size_dec).to(self.device)
+            for di in range(max_length):
+                decoder_output_i, decoder_hidden = self.decoder(decoder_input, decoder_hidden, encoder_hidden)
+                topv, topi = decoder_output_i.topk(1)
+                decoder_input = topi.squeeze(-1).detach()
+                decoder_output[:,di,:] = decoder_output_i.squeeze()
+                decoder_idx.append(decoder_input)
+
+            # Create a mask, set value to 0 for tokens generated after the first EOS_IDX. Modify loss calculation during training
+            decoder_idx = torch.cat(decoder_idx, 1)
+            for i in range(batchSize):
+                for j in range(max_length):
+                    if decoder_idx[i][j].item() == EOS_IDX:
+                        mask[i,j:] = 0
+        if self.flg_cuda:
+            mask = mask.cuda()
+        return decoder_output, decoder_idx, mask, []
+
+    def inference(self, data, target, data_len, target_len):
+        encoder_output, encoder_hidden = self.encoder(data)
+        decoder_output, decoder_idx, mask = self._decode(encoder_hidden, target, use_teacher_forcing = False)
+        return decoder_output, decoder_idx, mask, []
+
+
+#========== Attention enc-dec ==============
+class AttnDecoderRNN(nn.Module):
+    def __init__(self, embedding, dimLSTM_enc, dimLSTM_dec, vocab_size, emb_dim, p_dropOut, flg_updateEmb):
+        super(AttnDecoderRNN, self).__init__()
+
+        self.dimLSTM_dec = dimLSTM_dec
+        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=PAD_IDX)
+
+        if embedding is not None:
+            self.embedding.weight = nn.Parameter(embedding, requires_grad=flg_updateEmb)
+
+        self.out = nn.Linear(dimLSTM_dec, vocab_size)
+        self.attn = nn.Linear(dimLSTM_enc * 2 + emb_dim, self.dimLSTM_dec) # Assume encoder is bi-directional
+        self.dropout = nn.Dropout(p=p_dropOut)
+
+        self.gru = nn.GRU(self.dimLSTM_dec + emb_dim, self.dimLSTM_dec, batch_first=True)
+        self.softmax = nn.LogSoftmax(dim=2)
+
+        self.params = list(self.gru.parameters()) + list(self.out.parameters()) + list(self.attn.parameters())
+        if flg_updateEmb:
+            self.params += list(self.embedding.parameters())
+
+    def forward(self, input, hidden, encoder_outputs):
+        # encoder_outputs.shape: batch x seq_len x dimLSTM_enc*2
+        # Get the embedding of the current input
+        embedded = self.dropout(self.embedding(input)) # Batch x seq_len=1 x emb_dim
+        # Get weights from dot product
+        query = self.attn(torch.cat((embedded, hidden.transpose(0,1)), dim=2)) # Batch x seq_len=1 x dimLSTM_dec
+        attn_weights = torch.bmm(query, encoder_outputs.transpose(1, 2)) # Batch x 1 x seq_len_enc
+
+        # Softmax to normalize
+        attn_weights = F.softmax(attn_weights, dim = 2) # Batch x 1 x seq_len_enc
+
+        # apply to encoder outputs to get weighted average
+        context = attn_weights.bmm(encoder_outputs)
+        rnn_input = torch.cat((embedded, context), 2)
+        output, hidden = self.gru(rnn_input, hidden)
+        output = F.log_softmax(self.out(output.squeeze()), dim=1)
+        return output, hidden, attn_weights
+
+
+
+class AttRNNseq2seq(nn.Module):
+    def __init__(self, model_paras, data_emb, target_emb):
+        super(AttRNNseq2seq, self).__init__()
+        self.model_paras = model_paras
+        self.flg_cuda = torch.cuda.is_available()
+        self.device = torch.device("cuda" if self.flg_cuda else "cpu")
+        self.teacher_forcing_ratio = model_paras.get('teacher_forcing_ratio', 0.0)
+
+        vocab_size_enc = model_paras.get('vocab_size_enc', 100000)
+        self.vocab_size_dec = model_paras.get('vocab_size_dec', 100000)
+
+        emb_dim_enc = model_paras.get('emb_dim_enc', 300)
+        emb_dim_dec = model_paras.get('emb_dim_dec', 300)
+
+        dimLSTM_enc = model_paras.get('dimLSTM_enc', 128)
+        dimLSTM_dec = model_paras.get('dimLSTM_dec', 128)
+
+        nLSTM_enc = model_paras.get('nLSTM_enc', 1)
+        flg_bidirectional_enc = True
+        flg_updateEmb = model_paras.get('flg_updateEmb', False)
+        p_dropOut = model_paras.get('p_dropOut', 0.5)
+
+        self.encoder = EncoderRNN(data_emb, dimLSTM_enc, nLSTM_enc, vocab_size_enc, emb_dim_enc, flg_bidirectional_enc, p_dropOut, flg_updateEmb)
+        self.decoder = AttnDecoderRNN(target_emb, dimLSTM_enc, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb)
+
+        self.params = self.encoder.params + self.decoder.params
+
+    def forward(self, data, target, data_len, target_len):
+        encoder_output, encoder_hidden = self.encoder(data)
+        use_teacher_forcing = True if random.random() < self.teacher_forcing_ratio else False
+        decoder_output, decoder_idx, mask, att_weights = self._decode(encoder_hidden, encoder_output, target, use_teacher_forcing)
+        return decoder_output, decoder_idx, mask, att_weights
+
+    def _decode(self, encoder_hidden, encoder_output, target, use_teacher_forcing):
+        batchSize, max_length = target.shape
+        enc_len = encoder_output.shape[1]
+        decoder_hidden = encoder_hidden.transpose(0,1)
+        mask = torch.ones(target.shape)
+        decoder_input = torch.tensor([SOS_IDX]*batchSize, device=self.device).view(batchSize, 1)
+        decoder_idx = []
+        att_weights = torch.zeros(batchSize, max_length, enc_len).to(self.device)
+
+        decoder_output = torch.zeros(batchSize, max_length, self.vocab_size_dec).to(self.device)
+        for di in range(max_length):
+            decoder_output_i, decoder_hidden, att_w_i = self.decoder(decoder_input, decoder_hidden, encoder_output)
+            if use_teacher_forcing:
+                decoder_input = target[:, di].view(-1,1)
+            else:
+                topv, topi = decoder_output_i.topk(1)
+                decoder_input = topi.squeeze(-1).detach().view(-1,1)
+            decoder_output[:, di, :] = decoder_output_i.squeeze()
+            decoder_idx.append(decoder_input)
+            att_weights[:, di, :] = att_w_i.squeeze()
+
+            # Create a mask, set value to 0 for tokens generated after the first EOS_IDX. Modify loss calculation during training
+        decoder_idx = torch.cat(decoder_idx, 1)
+        for i in range(batchSize):
+            for j in range(max_length):
+                if decoder_idx[i][j].item() == EOS_IDX:
+                    mask[i,j:] = 0
+        if self.flg_cuda:
+            mask = mask.cuda()
+        return decoder_output, decoder_idx, mask, att_weights
+
+    def inference(self, data, target, data_len, target_len):
+        encoder_output, encoder_hidden = self.encoder(data)
+        decoder_output, decoder_idx, mask, att_weights = self._decode(encoder_hidden, encoder_output, target, use_teacher_forcing = False)
+        return decoder_output, decoder_idx, mask, att_weights
+
+
+#=========== Self-att encoder ===============
+
+
+"""
+
+## Code based on http://nlp.seas.harvard.edu/2018/04/03/attention.html
+def clones(module, N):
+    "Produce N identical layers."
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+
+class LayerNorm(nn.Module):
+    "Construct a layernorm module (See citation for details)."
+    def __init__(self, features, eps=1e-6):
+        super(LayerNorm, self).__init__()
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+
+class Embeddings(nn.Module):
+    def __init__(self, d_model, vocab, flg_updateEmb, embedding = None):
+        super(Embeddings, self).__init__()
+        self.lut = nn.Embedding(vocab, d_model)
+        self.d_model = d_model
+        if embedding is not None:
+            self.embedding.weight = nn.Parameter(embedding, requires_grad=flg_updateEmb)
+
+    def forward(self, x):
+        return self.lut(x) * math.sqrt(self.d_model)
+
+
+
+
+def subsequent_mask(size):
+    "Mask out subsequent positions."
+    attn_shape = (1, size, size)
+    subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
+    return torch.from_numpy(subsequent_mask) == 0
+
+
+def attention(query, key, value, mask=None, dropout=None):
+    "Compute 'Scaled Dot Product Attention'"
+    d_k = query.size(-1)
+    scores = torch.matmul(query, key.transpose(-2, -1)) \
+             / math.sqrt(d_k)
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, -1e9)
+    p_attn = F.softmax(scores, dim = -1)
+    if dropout is not None:
+        p_attn = dropout(p_attn)
+    return torch.matmul(p_attn, value), p_attn
+
+
+class MultiHeadedAttention(nn.Module):
+    def __init__(self, h, d_model, dropout=0.1):
+        "Take in model size and number of heads."
+        super(MultiHeadedAttention, self).__init__()
+        assert d_model % h == 0
+        # We assume d_v always equals d_k
+        self.d_k = d_model // h
+        self.h = h
+        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, query, key, value, mask=None):
+        "Implements Figure 2"
+        if mask is not None:
+            # Same mask applied to all h heads.
+            mask = mask.unsqueeze(1)
+        nbatches = query.size(0)
+
+        # 1) Do all the linear projections in batch from d_model => h x d_k
+        query, key, value = \
+            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+             for l, x in zip(self.linears, (query, key, value))]
+
+        # 2) Apply attention on all the projected vectors in batch.
+        x, self.attn = attention(query, key, value, mask=mask,
+                                 dropout=self.dropout)
+
+        # 3) "Concat" using a view and apply a final linear.
+        x = x.transpose(1, 2).contiguous() \
+            .view(nbatches, -1, self.h * self.d_k)
+        return self.linears[-1](x)
+
+class PositionwiseFeedForward(nn.Module):
+    "Implements FFN equation."
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.w_2(self.dropout(F.relu(self.w_1(x))))
+
+
+class PositionalEncoding(nn.Module):
+    "Implement the PE function."
+
+    def __init__(self, d_model, dropout, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        # Compute the positional encodings once in log space.
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) *
+                             -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + Variable(self.pe[:, :x.size(1)],
+                         requires_grad=False)
+        return self.dropout(x)
+
+
+class SublayerConnection(nn.Module):
+    '''
+    A residual connection followed by a layer norm.
+    Note for code simplicity the norm is first as opposed to last.
+    '''
+    def __init__(self, size, dropout):
+        super(SublayerConnection, self).__init__()
+        self.norm = LayerNorm(size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, sublayer):
+        "Apply residual connection to any sublayer with the same size."
+        return x + self.dropout(sublayer(self.norm(x)))
+
+
+class EncoderLayer(nn.Module):
+    "Encoder is made up of self-attn and feed forward (defined below)"
+    def __init__(self, size, self_attn, feed_forward, dropout):
+        super(EncoderLayer, self).__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.size = size
+
+    def forward(self, x, mask):
+        "Follow Figure 1 (left) for connections."
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        return self.sublayer[1](x, self.feed_forward)
+
+
+class Encoder(nn.Module):
+    "Core encoder is a stack of N layers"
+
+    def __init__(self, layer, N):
+        super(Encoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+
+    def forward(self, x, mask):
+        "Pass the input (and mask) through each layer in turn."
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
+
+
+class SelfAttEncDec(nn.Module):
+    '''
+    Model using self-attention encoder, and decoder with attention from encoder output
+    '''
+    def __init__(self, model_paras, data_emb, target_emb):
+        super(SelfAttEncDec, self).__init__()
+
+        self.model_paras = model_paras
+        self.flg_cuda = torch.cuda.is_available()
+        self.device = torch.device("cuda" if self.flg_cuda else "cpu")
+        self.teacher_forcing_ratio = model_paras.get('teacher_forcing_ratio', 0.0)
+
+        vocab_size_enc = model_paras.get('vocab_size_enc', 100000)
+        self.vocab_size_dec = model_paras.get('vocab_size_dec', 100000)
+
+        emb_dim_enc = model_paras.get('emb_dim_enc', 300)
+        emb_dim_dec = model_paras.get('emb_dim_dec', 300)
+
+        dimLSTM_dec = model_paras.get('dimLSTM_dec', 128)
+
+        flg_updateEmb = model_paras.get('flg_updateEmb', False)
+        p_dropOut = model_paras.get('p_dropOut', 0.5)
+
+        nHead = model_paras.get('nHead', 8) # Number of heads in multi-headed att
+        #dimHidden_enc = model_paras.get('dimHidden_enc', 512) # Dimension of encoder Q/V/K vectors
+        dimFF_enc = model_paras.get('dimFF_enc', 2048) # Dimension of feed-forward layer
+        nStack_enc = model_paras.get('nStack_enc', 6) # Number of stacks of encoder
+
+        c = copy.deepcopy
+        attn = MultiHeadedAttention(nHead, emb_dim_enc)
+        ff = PositionwiseFeedForward(emb_dim_enc, dimFF_enc, p_dropOut)
+        position = PositionalEncoding(emb_dim_enc, p_dropOut)
+
+        self.emb_encoder = nn.Sequential(Embeddings(emb_dim_enc, vocab_size_enc, flg_updateEmb, data_emb), c(position))
+
+        self.encoder = Encoder(EncoderLayer(emb_dim_enc, c(attn), c(ff), p_dropOut), nStack_enc)
+        self.decoder = DecoderRNN(target_emb, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb)
+
+        self.params = self.encoder.params + self.decoder.params #TODO: Update this
+
+        for p in self.params():
+            if p.dim() > 1:
+                nn.init.xavier_uniform(p)
+
+    def forward(self, data, target, data_len, target_len):
+        encoder_output, encoder_hidden = self.encoder(data)
+        use_teacher_forcing = True if random.random() < self.teacher_forcing_ratio else False
+        decoder_output, decoder_idx, mask = self._decode(encoder_hidden, target, use_teacher_forcing)
+        return decoder_output, decoder_idx, mask
+
+    def _decode(self, encoder_hidden, target, use_teacher_forcing):
+        batchSize, max_length = target.shape
+        decoder_hidden = encoder_hidden.transpose(0,1)
+        mask = torch.ones(target.shape)
+        decoder_input = torch.tensor([SOS_IDX]*batchSize, device=self.device).view(batchSize, 1)
+        decoder_idx = []
+
+        if use_teacher_forcing:
+            decoder_input = torch.cat([decoder_input, target[:,0:-1]], 1) # All inputs known, don't need to iterate
             encoder_hidden_seq = encoder_hidden.repeat(1, max_length, 1)
             decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden, encoder_hidden_seq)
 
@@ -203,8 +575,7 @@ class RNNseq2seq(nn.Module):
         encoder_output, encoder_hidden = self.encoder(data)
         decoder_output, decoder_idx, mask = self._decode(encoder_hidden, target, use_teacher_forcing = False)
         return decoder_output, decoder_idx, mask
-
-
+"""
 
 #=========== Training Class ==========
 
@@ -276,7 +647,7 @@ class trainModel(object):
                 data, target, data_len, target_len = data.cuda(), target.cuda(), data_len.cuda(), target_len.cuda()
 
             self.optimizer.zero_grad()
-            output, idx, mask = self.model(data, target, data_len, target_len)
+            output, idx, mask, att_weights = self.model(data, target, data_len, target_len)
             loss = self.criterion(output.transpose(1,2), target)
             loss = (loss * mask).sum() / mask.sum()
             loss.backward()
@@ -314,7 +685,7 @@ class trainModel(object):
                     data, target, data_len, target_len = data.cuda(), target.cuda(), data_len.cuda(), target_len.cuda()
 
                 with torch.no_grad():
-                    output, idx, mask = self.model.inference(data, target, data_len, target_len)
+                    output, idx, mask, att_weights = self.model.inference(data, target, data_len, target_len)
                     test_loss_step = self.criterion(output.transpose(1, 2), target)
                     test_loss_step = (test_loss_step * mask).sum() / mask.sum()
                     test_loss += test_loss_step * data.size()[0]
