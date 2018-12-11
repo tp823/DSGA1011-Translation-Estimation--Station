@@ -507,7 +507,8 @@ class SelfAttEncRNNDec(nn.Module):
         emb_dim_enc = model_paras.get('emb_dim_enc', 300)
         emb_dim_dec = model_paras.get('emb_dim_dec', 300)
 
-        dimLSTM_dec = model_paras.get('dimLSTM_dec', 128)
+        dimLSTM_dec = model_paras.get('dimLSTM_dec', 300)
+        assert(dimLSTM_dec == emb_dim_enc) # By assumption, decoder hidden dimension is the same as encoder output dimension
 
         flg_updateEmb = model_paras.get('flg_updateEmb', False)
         p_dropOut = model_paras.get('p_dropOut', 0.5)
