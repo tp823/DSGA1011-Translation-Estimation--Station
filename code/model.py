@@ -27,8 +27,8 @@ EOS_IDX = 3
 
 class translationDataset(Dataset):
     def __init__(self, root_dir, data_name, target_name, dataLength, targetLength):
-        self.data_list=pickle.load(open(root_dir + data_name + '.p', 'rb'))[0:200]
-        self.target_list=pickle.load(open(root_dir + target_name + '.p', 'rb'))[0:200]
+        self.data_list=pickle.load(open(root_dir + data_name + '.p', 'rb'))
+        self.target_list=pickle.load(open(root_dir + target_name + '.p', 'rb'))
         assert (len(self.data_list) == len(self.target_list))
         self.dataLength = dataLength
         self.targetLength = targetLength
