@@ -516,18 +516,20 @@ class SelfAttEncRNNDec(nn.Module):
         nHead = model_paras.get('nHead', 6) # Number of heads in multi-headed att
         nStack = model_paras.get('nStack', 2) # Number of encoder stacks
         dimFF = model_paras.get('dimFF', 128) # Feed-forward hidden layer size
+        self.flg_initAvg = model_paras.get('flg_initAvg', False) # Init hidden layer with average encoder output
 
         c = copy.deepcopy
         attn = MultiHeadedAttention(nHead, emb_dim_enc)
         ff = PositionwiseFeedForward(emb_dim_enc, dimFF, p_dropOut)
         position = PositionalEncoding(emb_dim_enc, p_dropOut)
         emb = Embeddings(emb_dim_enc, vocab_size_enc, flg_updateEmb)
+        self.init_FF = nn.Linear(emb_dim_enc, dimLSTM_dec) # Convert average encoder output to decoder hidden init
 
         self.emb_enc = nn.Sequential(emb, c(position))
         self.encoder = Encoder(EncoderLayer(emb_dim_enc, c(attn), c(ff), p_dropOut), nStack)
         self.decoder = AttnDecoderRNN(target_emb, emb_dim_enc, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb)
 
-        self.params = emb.params + list(self.encoder.parameters()) + self.decoder.params # Fix this
+        self.params = emb.params + list(self.encoder.parameters()) + self.decoder.params + list(self.init_FF.parameters())# Fix this
 
     def forward(self, data, target, data_len, target_len):
         batchSize = data.shape[0]
@@ -535,7 +537,10 @@ class SelfAttEncRNNDec(nn.Module):
         if self.flg_cuda:
             src_mask = src_mask.cuda()
         encoder_output = self.encoder(self.emb_enc(data), src_mask)
-        encoder_hidden = self.decoder.init_hidden(batchSize, nlayers = 1)
+        if self.flg_initAvg:
+            encoder_hidden = self.init_FF(encoder_output.mean(dim=1)).view(1, batchSize, -1)
+        else:
+            encoder_hidden = self.decoder.init_hidden(batchSize, nlayers = 1)
         use_teacher_forcing = True if random.random() < self.teacher_forcing_ratio else False
         decoder_output, decoder_idx, mask, att_weights = self._decode(encoder_hidden, encoder_output, target, use_teacher_forcing)
         return decoder_output, decoder_idx, mask, att_weights
@@ -577,7 +582,10 @@ class SelfAttEncRNNDec(nn.Module):
         if self.flg_cuda:
             src_mask = src_mask.cuda()
         encoder_output = self.encoder(self.emb_enc(data), src_mask)
-        encoder_hidden = self.decoder.init_hidden(batchSize, nlayers=1)
+        if self.flg_initAvg:
+            encoder_hidden = self.init_FF(encoder_output.mean(dim=1)).view(1, batchSize, -1)
+        else:
+            encoder_hidden = self.decoder.init_hidden(batchSize, nlayers = 1)
         decoder_output, decoder_idx, mask, att_weights = self._decode(encoder_hidden, encoder_output, target, use_teacher_forcing = False)
         return decoder_output, decoder_idx, mask, att_weights
 
@@ -605,7 +613,7 @@ class trainModel(object):
 
         if self.lr_decay:
             assert len(self.lr_decay) == 4  # Elements include: [starting_lr, decay_multiplier, decay_per_?_epoch, min_lr]
-        self.criterion = torch.nn.NLLLoss(ignore_index=PAD_IDX, reduction='none')
+        self.criterion = torch.nn.NLLLoss(reduction='none')
         self.cnt_iter = 0
 
         self.lsTrainLoss = []
