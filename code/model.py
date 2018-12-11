@@ -167,8 +167,8 @@ class RNNseq2seq(nn.Module):
     def forward(self, data, target, data_len, target_len):
         encoder_output, encoder_hidden = self.encoder(data)
         use_teacher_forcing = True if random.random() < self.teacher_forcing_ratio else False
-        decoder_output, decoder_idx, mask = self._decode(encoder_hidden, target, use_teacher_forcing)
-        return decoder_output, decoder_idx, mask
+        decoder_output, decoder_idx, mask, _ = self._decode(encoder_hidden, target, use_teacher_forcing)
+        return decoder_output, decoder_idx, mask, []
 
     def _decode(self, encoder_hidden, target, use_teacher_forcing):
         batchSize, max_length = target.shape
@@ -489,7 +489,7 @@ class Encoder(nn.Module):
             x = layer(x, mask)
         return self.norm(x)
 
-## HERE
+
 class SelfAttEncRNNDec(nn.Module):
     '''
     Model using self-attention encoder, and decoder with attention from encoder output
