@@ -203,7 +203,7 @@ class RNNseq2seq(nn.Module):
 
     def inference(self, data, target, data_len, target_len):
         encoder_output, encoder_hidden = self.encoder(data)
-        decoder_output, decoder_idx, mask = self._decode(encoder_hidden, target, use_teacher_forcing = False)
+        decoder_output, decoder_idx, mask, _ = self._decode(encoder_hidden, target, use_teacher_forcing = False)
         return decoder_output, decoder_idx, mask, []
 
 
