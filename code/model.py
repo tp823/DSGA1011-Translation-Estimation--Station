@@ -27,8 +27,8 @@ EOS_IDX = 3
 
 class translationDataset(Dataset):
     def __init__(self, root_dir, data_name, target_name, dataLength, targetLength):
-        self.data_list=pickle.load(open(root_dir + data_name + '.p', 'rb'))
-        self.target_list=pickle.load(open(root_dir + target_name + '.p', 'rb'))
+        self.data_list=pickle.load(open(root_dir + data_name + '.p', 'rb'))[0:200]
+        self.target_list=pickle.load(open(root_dir + target_name + '.p', 'rb'))[0:200]
         assert (len(self.data_list) == len(self.target_list))
         self.dataLength = dataLength
         self.targetLength = targetLength
@@ -209,7 +209,7 @@ class RNNseq2seq(nn.Module):
 
 #========== Attention enc-dec ==============
 class AttnDecoderRNN(nn.Module):
-    def __init__(self, embedding, dimLSTM_enc, dimLSTM_dec, vocab_size, emb_dim, p_dropOut, flg_updateEmb):
+    def __init__(self, embedding, dimLSTM_dec, vocab_size, emb_dim, p_dropOut, flg_updateEmb):
         super(AttnDecoderRNN, self).__init__()
 
         self.dimLSTM_dec = dimLSTM_dec
@@ -219,7 +219,7 @@ class AttnDecoderRNN(nn.Module):
             self.embedding.weight = nn.Parameter(embedding, requires_grad=flg_updateEmb)
 
         self.out = nn.Linear(dimLSTM_dec, vocab_size)
-        self.attn = nn.Linear(dimLSTM_enc * 2 + emb_dim, self.dimLSTM_dec) # Assume encoder is bi-directional
+        self.attn = nn.Linear(dimLSTM_dec + emb_dim, self.dimLSTM_dec) # dimLSTM_enc should be the entire encoder output size, so double the size if bi-Directional
         self.dropout = nn.Dropout(p=p_dropOut)
 
         self.gru = nn.GRU(self.dimLSTM_dec + emb_dim, self.dimLSTM_dec, batch_first=True)
@@ -247,6 +247,12 @@ class AttnDecoderRNN(nn.Module):
         output = F.log_softmax(self.out(output.squeeze()), dim=1)
         return output, hidden, attn_weights
 
+    def init_hidden(self, batchSize, nlayers):
+        if torch.cuda.is_available():
+            return Variable(torch.zeros(nlayers, batchSize, self.dimLSTM_dec)).cuda()
+        else:
+            return Variable(torch.zeros(nlayers, batchSize, self.dimLSTM_dec))
+
 
 
 class AttRNNseq2seq(nn.Module):
@@ -272,7 +278,7 @@ class AttRNNseq2seq(nn.Module):
         p_dropOut = model_paras.get('p_dropOut', 0.5)
 
         self.encoder = EncoderRNN(data_emb, dimLSTM_enc, nLSTM_enc, vocab_size_enc, emb_dim_enc, flg_bidirectional_enc, p_dropOut, flg_updateEmb)
-        self.decoder = AttnDecoderRNN(target_emb, dimLSTM_enc, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb)
+        self.decoder = AttnDecoderRNN(target_emb, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb) # Assume encoder is bi-directional
 
         self.params = self.encoder.params + self.decoder.params
 
@@ -322,15 +328,13 @@ class AttRNNseq2seq(nn.Module):
 #=========== Self-att encoder ===============
 
 
-"""
-
 ## Code based on http://nlp.seas.harvard.edu/2018/04/03/attention.html
 def clones(module, N):
     "Produce N identical layers."
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
 class LayerNorm(nn.Module):
-    "Construct a layernorm module (See citation for details)."
+    "Construct a layernorm module "
     def __init__(self, features, eps=1e-6):
         super(LayerNorm, self).__init__()
         self.a_2 = nn.Parameter(torch.ones(features))
@@ -338,22 +342,23 @@ class LayerNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        mean = x.mean(-1, keepdim=True)
+        mean = x.mean(-1, keepdim=True) ##TODO: double check dim
         std = x.std(-1, keepdim=True)
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
 
 class Embeddings(nn.Module):
-    def __init__(self, d_model, vocab, flg_updateEmb, embedding = None):
+    def __init__(self, emb_dim, vocab, flg_updateEmb, embedding = None):
         super(Embeddings, self).__init__()
-        self.lut = nn.Embedding(vocab, d_model)
-        self.d_model = d_model
+        self.lut = nn.Embedding(vocab, emb_dim, padding_idx=PAD_IDX)
+        self.emb_dim = emb_dim
+        self.params = []
         if embedding is not None:
             self.embedding.weight = nn.Parameter(embedding, requires_grad=flg_updateEmb)
+            self.params += list(self.embedding.parameters())
 
     def forward(self, x):
-        return self.lut(x) * math.sqrt(self.d_model)
-
+        return self.lut(x) * math.sqrt(self.emb_dim)
 
 
 
@@ -367,8 +372,7 @@ def subsequent_mask(size):
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
     d_k = query.size(-1)
-    scores = torch.matmul(query, key.transpose(-2, -1)) \
-             / math.sqrt(d_k)
+    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
     if mask is not None:
         scores = scores.masked_fill(mask == 0, -1e9)
     p_attn = F.softmax(scores, dim = -1)
@@ -378,41 +382,38 @@ def attention(query, key, value, mask=None, dropout=None):
 
 
 class MultiHeadedAttention(nn.Module):
-    def __init__(self, h, d_model, dropout=0.1):
+    def __init__(self, nHeads, d_model, dropout=0.1):
         "Take in model size and number of heads."
         super(MultiHeadedAttention, self).__init__()
-        assert d_model % h == 0
+        assert d_model % nHeads == 0
         # We assume d_v always equals d_k
-        self.d_k = d_model // h
-        self.h = h
+        self.d_k = d_model // nHeads
+        self.nHeads = nHeads
         self.linears = clones(nn.Linear(d_model, d_model), 4)
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, query, key, value, mask=None):
-        "Implements Figure 2"
         if mask is not None:
             # Same mask applied to all h heads.
             mask = mask.unsqueeze(1)
         nbatches = query.size(0)
 
         # 1) Do all the linear projections in batch from d_model => h x d_k
-        query, key, value = \
-            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
-             for l, x in zip(self.linears, (query, key, value))]
+        query, key, value = [l(x).view(nbatches, -1, self.nHeads, self.d_k).transpose(1, 2) for l, x in zip(self.linears, (query, key, value))]
 
         # 2) Apply attention on all the projected vectors in batch.
-        x, self.attn = attention(query, key, value, mask=mask,
-                                 dropout=self.dropout)
+        x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
 
-        # 3) "Concat" using a view and apply a final linear.
-        x = x.transpose(1, 2).contiguous() \
-            .view(nbatches, -1, self.h * self.d_k)
+        # 3) "Concat" using a view and apply a final linear. Assume output dim is also d_model
+        x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.nHeads * self.d_k)
         return self.linears[-1](x)
+
+
 
 class PositionwiseFeedForward(nn.Module):
     "Implements FFN equation."
-    def __init__(self, d_model, d_ff, dropout=0.1):
+    def __init__(self, d_model, d_ff, dropout):
         super(PositionwiseFeedForward, self).__init__()
         self.w_1 = nn.Linear(d_model, d_ff)
         self.w_2 = nn.Linear(d_ff, d_model)
@@ -431,17 +432,15 @@ class PositionalEncoding(nn.Module):
 
         # Compute the positional encodings once in log space.
         pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) *
-                             -(math.log(10000.0) / d_model))
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp( (torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model)).float() )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        x = x + Variable(self.pe[:, :x.size(1)],
-                         requires_grad=False)
+        x = x + Variable(self.pe[:, :x.size(1)], requires_grad=False)
         return self.dropout(x)
 
 
@@ -489,13 +488,13 @@ class Encoder(nn.Module):
             x = layer(x, mask)
         return self.norm(x)
 
-
-class SelfAttEncDec(nn.Module):
+## HERE
+class SelfAttEncRNNDec(nn.Module):
     '''
     Model using self-attention encoder, and decoder with attention from encoder output
     '''
     def __init__(self, model_paras, data_emb, target_emb):
-        super(SelfAttEncDec, self).__init__()
+        super(SelfAttEncRNNDec, self).__init__()
 
         self.model_paras = model_paras
         self.flg_cuda = torch.cuda.is_available()
@@ -513,69 +512,71 @@ class SelfAttEncDec(nn.Module):
         flg_updateEmb = model_paras.get('flg_updateEmb', False)
         p_dropOut = model_paras.get('p_dropOut', 0.5)
 
-        nHead = model_paras.get('nHead', 8) # Number of heads in multi-headed att
-        #dimHidden_enc = model_paras.get('dimHidden_enc', 512) # Dimension of encoder Q/V/K vectors
-        dimFF_enc = model_paras.get('dimFF_enc', 2048) # Dimension of feed-forward layer
-        nStack_enc = model_paras.get('nStack_enc', 6) # Number of stacks of encoder
+        nHead = model_paras.get('nHead', 6) # Number of heads in multi-headed att
+        nStack = model_paras.get('nStack', 2) # Number of encoder stacks
+        dimFF = model_paras.get('dimFF', 128) # Feed-forward hidden layer size
 
         c = copy.deepcopy
         attn = MultiHeadedAttention(nHead, emb_dim_enc)
-        ff = PositionwiseFeedForward(emb_dim_enc, dimFF_enc, p_dropOut)
+        ff = PositionwiseFeedForward(emb_dim_enc, dimFF, p_dropOut)
         position = PositionalEncoding(emb_dim_enc, p_dropOut)
+        emb = Embeddings(emb_dim_enc, vocab_size_enc, flg_updateEmb)
 
-        self.emb_encoder = nn.Sequential(Embeddings(emb_dim_enc, vocab_size_enc, flg_updateEmb, data_emb), c(position))
+        self.emb_enc = nn.Sequential(emb, c(position))
+        self.encoder = Encoder(EncoderLayer(emb_dim_enc, c(attn), c(ff), p_dropOut), nStack)
+        self.decoder = AttnDecoderRNN(target_emb, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb)
 
-        self.encoder = Encoder(EncoderLayer(emb_dim_enc, c(attn), c(ff), p_dropOut), nStack_enc)
-        self.decoder = DecoderRNN(target_emb, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb)
-
-        self.params = self.encoder.params + self.decoder.params #TODO: Update this
-
-        for p in self.params():
-            if p.dim() > 1:
-                nn.init.xavier_uniform(p)
+        self.params = emb.params + list(self.encoder.parameters()) + self.decoder.params # Fix this
 
     def forward(self, data, target, data_len, target_len):
-        encoder_output, encoder_hidden = self.encoder(data)
+        batchSize = data.shape[0]
+        src_mask = (data != PAD_IDX).unsqueeze(-2)
+        encoder_output = self.encoder(self.emb_enc(data), src_mask)
+        encoder_hidden = self.decoder.init_hidden(batchSize, nlayers = 1)
         use_teacher_forcing = True if random.random() < self.teacher_forcing_ratio else False
-        decoder_output, decoder_idx, mask = self._decode(encoder_hidden, target, use_teacher_forcing)
-        return decoder_output, decoder_idx, mask
+        decoder_output, decoder_idx, mask, att_weights = self._decode(encoder_hidden, encoder_output, target, use_teacher_forcing)
+        return decoder_output, decoder_idx, mask, att_weights
 
-    def _decode(self, encoder_hidden, target, use_teacher_forcing):
+    def _decode(self, encoder_hidden, encoder_output, target, use_teacher_forcing):
         batchSize, max_length = target.shape
-        decoder_hidden = encoder_hidden.transpose(0,1)
+        enc_len = encoder_output.shape[1]
+        decoder_hidden = encoder_hidden
         mask = torch.ones(target.shape)
         decoder_input = torch.tensor([SOS_IDX]*batchSize, device=self.device).view(batchSize, 1)
         decoder_idx = []
+        att_weights = torch.zeros(batchSize, max_length, enc_len).to(self.device) # from decoder
 
-        if use_teacher_forcing:
-            decoder_input = torch.cat([decoder_input, target[:,0:-1]], 1) # All inputs known, don't need to iterate
-            encoder_hidden_seq = encoder_hidden.repeat(1, max_length, 1)
-            decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden, encoder_hidden_seq)
-
-        else:
-            decoder_output = torch.zeros(batchSize, max_length, self.vocab_size_dec).to(self.device)
-            for di in range(max_length):
-                decoder_output_i, decoder_hidden = self.decoder(decoder_input, decoder_hidden, encoder_hidden)
+        decoder_output = torch.zeros(batchSize, max_length, self.vocab_size_dec).to(self.device)
+        for di in range(max_length):
+            decoder_output_i, decoder_hidden, att_w_i = self.decoder(decoder_input, decoder_hidden, encoder_output)
+            if use_teacher_forcing:
+                decoder_input = target[:, di].view(-1,1)
+            else:
                 topv, topi = decoder_output_i.topk(1)
-                decoder_input = topi.squeeze(-1).detach()
-                decoder_output[:,di,:] = decoder_output_i.squeeze()
-                decoder_idx.append(decoder_input)
+                decoder_input = topi.squeeze(-1).detach().view(-1,1)
+            decoder_output[:, di, :] = decoder_output_i.squeeze()
+            decoder_idx.append(decoder_input)
+            att_weights[:, di, :] = att_w_i.squeeze()
 
             # Create a mask, set value to 0 for tokens generated after the first EOS_IDX. Modify loss calculation during training
-            decoder_idx = torch.cat(decoder_idx, 1)
-            for i in range(batchSize):
-                for j in range(max_length):
-                    if decoder_idx[i][j].item() == EOS_IDX:
-                        mask[i,j:] = 0
+        decoder_idx = torch.cat(decoder_idx, 1)
+        for i in range(batchSize):
+            for j in range(max_length):
+                if decoder_idx[i][j].item() == EOS_IDX:
+                    mask[i,j:] = 0
         if self.flg_cuda:
             mask = mask.cuda()
-        return decoder_output, decoder_idx, mask
+        return decoder_output, decoder_idx, mask, att_weights
 
     def inference(self, data, target, data_len, target_len):
-        encoder_output, encoder_hidden = self.encoder(data)
-        decoder_output, decoder_idx, mask = self._decode(encoder_hidden, target, use_teacher_forcing = False)
-        return decoder_output, decoder_idx, mask
-"""
+        batchSize = data.shape[0]
+        src_mask = (data != PAD_IDX).unsqueeze(-2)
+        encoder_output = self.encoder(self.emb_enc(data), src_mask)
+        encoder_hidden = self.decoder.init_hidden(batchSize, nlayers=1)
+        decoder_output, decoder_idx, mask, att_weights = self._decode(encoder_hidden, encoder_output, target, use_teacher_forcing = False)
+        return decoder_output, decoder_idx, mask, att_weights
+
+
 
 #=========== Training Class ==========
 
@@ -608,6 +609,8 @@ class trainModel(object):
         self.bestAccuracy = 0.0
         self.acc = 0.0
         np.random.seed(train_paras.get('randSeed', 42))
+
+
 
     def run(self):
         for epoch in range(self.n_iter):
