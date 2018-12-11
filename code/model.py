@@ -209,7 +209,7 @@ class RNNseq2seq(nn.Module):
 
 #========== Attention enc-dec ==============
 class AttnDecoderRNN(nn.Module):
-    def __init__(self, embedding, dimLSTM_dec, vocab_size, emb_dim, p_dropOut, flg_updateEmb):
+    def __init__(self, embedding, dim_enc, dimLSTM_dec, vocab_size, emb_dim, p_dropOut, flg_updateEmb):
         super(AttnDecoderRNN, self).__init__()
 
         self.dimLSTM_dec = dimLSTM_dec
@@ -219,10 +219,10 @@ class AttnDecoderRNN(nn.Module):
             self.embedding.weight = nn.Parameter(embedding, requires_grad=flg_updateEmb)
 
         self.out = nn.Linear(dimLSTM_dec, vocab_size)
-        self.attn = nn.Linear(dimLSTM_dec + emb_dim, self.dimLSTM_dec) # dimLSTM_enc should be the entire encoder output size, so double the size if bi-Directional
+        self.attn = nn.Linear(dimLSTM_dec + emb_dim, dim_enc) # dimLSTM_enc should be the entire encoder output size, so double the size if bi-Directional
         self.dropout = nn.Dropout(p=p_dropOut)
 
-        self.gru = nn.GRU(self.dimLSTM_dec + emb_dim, self.dimLSTM_dec, batch_first=True)
+        self.gru = nn.GRU(dim_enc + emb_dim, self.dimLSTM_dec, batch_first=True)
         self.softmax = nn.LogSoftmax(dim=2)
 
         self.params = list(self.gru.parameters()) + list(self.out.parameters()) + list(self.attn.parameters())
@@ -234,7 +234,7 @@ class AttnDecoderRNN(nn.Module):
         # Get the embedding of the current input
         embedded = self.dropout(self.embedding(input)) # Batch x seq_len=1 x emb_dim
         # Get weights from dot product
-        query = self.attn(torch.cat((embedded, hidden.transpose(0,1)), dim=2)) # Batch x seq_len=1 x dimLSTM_dec
+        query = self.attn(torch.cat((embedded, hidden.transpose(0,1)), dim=2)) # Batch x seq_len=1 x dim_enc
         attn_weights = torch.bmm(query, encoder_outputs.transpose(1, 2)) # Batch x 1 x seq_len_enc
 
         # Softmax to normalize
@@ -270,7 +270,8 @@ class AttRNNseq2seq(nn.Module):
         emb_dim_dec = model_paras.get('emb_dim_dec', 300)
 
         dimLSTM_enc = model_paras.get('dimLSTM_enc', 128)
-        dimLSTM_dec = model_paras.get('dimLSTM_dec', 128)
+        dimLSTM_dec = model_paras.get('dimLSTM_dec', 256)
+        assert (dimLSTM_enc * 2 == dimLSTM_dec) # Use last enc hidden as dec start
 
         nLSTM_enc = model_paras.get('nLSTM_enc', 1)
         flg_bidirectional_enc = True
@@ -278,7 +279,7 @@ class AttRNNseq2seq(nn.Module):
         p_dropOut = model_paras.get('p_dropOut', 0.5)
 
         self.encoder = EncoderRNN(data_emb, dimLSTM_enc, nLSTM_enc, vocab_size_enc, emb_dim_enc, flg_bidirectional_enc, p_dropOut, flg_updateEmb)
-        self.decoder = AttnDecoderRNN(target_emb, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb) # Assume encoder is bi-directional
+        self.decoder = AttnDecoderRNN(target_emb, dimLSTM_enc*2, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb) # Assume encoder is bi-directional
 
         self.params = self.encoder.params + self.decoder.params
 
@@ -508,7 +509,6 @@ class SelfAttEncRNNDec(nn.Module):
         emb_dim_dec = model_paras.get('emb_dim_dec', 300)
 
         dimLSTM_dec = model_paras.get('dimLSTM_dec', 300)
-        assert(dimLSTM_dec == emb_dim_enc) # By assumption, decoder hidden dimension is the same as encoder output dimension
 
         flg_updateEmb = model_paras.get('flg_updateEmb', False)
         p_dropOut = model_paras.get('p_dropOut', 0.5)
@@ -525,13 +525,15 @@ class SelfAttEncRNNDec(nn.Module):
 
         self.emb_enc = nn.Sequential(emb, c(position))
         self.encoder = Encoder(EncoderLayer(emb_dim_enc, c(attn), c(ff), p_dropOut), nStack)
-        self.decoder = AttnDecoderRNN(target_emb, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb)
+        self.decoder = AttnDecoderRNN(target_emb, emb_dim_enc, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb)
 
         self.params = emb.params + list(self.encoder.parameters()) + self.decoder.params # Fix this
 
     def forward(self, data, target, data_len, target_len):
         batchSize = data.shape[0]
         src_mask = (data != PAD_IDX).unsqueeze(-2)
+        if self.flg_cuda:
+            src_mask = src_mask.cuda()
         encoder_output = self.encoder(self.emb_enc(data), src_mask)
         encoder_hidden = self.decoder.init_hidden(batchSize, nlayers = 1)
         use_teacher_forcing = True if random.random() < self.teacher_forcing_ratio else False
@@ -572,6 +574,8 @@ class SelfAttEncRNNDec(nn.Module):
     def inference(self, data, target, data_len, target_len):
         batchSize = data.shape[0]
         src_mask = (data != PAD_IDX).unsqueeze(-2)
+        if self.flg_cuda:
+            src_mask = src_mask.cuda()
         encoder_output = self.encoder(self.emb_enc(data), src_mask)
         encoder_hidden = self.decoder.init_hidden(batchSize, nlayers=1)
         decoder_output, decoder_idx, mask, att_weights = self._decode(encoder_hidden, encoder_output, target, use_teacher_forcing = False)
