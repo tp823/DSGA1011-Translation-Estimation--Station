@@ -191,12 +191,12 @@ class RNNseq2seq(nn.Module):
                 decoder_output[:,di,:] = decoder_output_i.squeeze()
                 decoder_idx.append(decoder_input)
 
-            # Create a mask, set value to 0 for tokens generated after the first EOS_IDX. Modify loss calculation during training
-            decoder_idx = torch.cat(decoder_idx, 1)
-            for i in range(batchSize):
-                for j in range(max_length):
-                    if decoder_idx[i][j].item() == EOS_IDX:
-                        mask[i,j:] = 0
+        # Create a mask, set value to 0 for tokens generated after the first EOS_IDX. Modify loss calculation during training
+        decoder_idx = torch.cat(decoder_idx, 1)
+        for i in range(batchSize):
+            for j in range(max_length):
+                if decoder_idx[i][j].item() == EOS_IDX:
+                    mask[i,j:] = 0
         if self.flg_cuda:
             mask = mask.cuda()
         return decoder_output, decoder_idx, mask, []
@@ -209,9 +209,10 @@ class RNNseq2seq(nn.Module):
 
 #========== Attention enc-dec ==============
 class AttnDecoderRNN(nn.Module):
-    def __init__(self, embedding, dim_enc, dimLSTM_dec, vocab_size, emb_dim, p_dropOut, flg_updateEmb):
+    def __init__(self, embedding, dim_enc, dimLSTM_dec, vocab_size, emb_dim, p_dropOut, flg_updateEmb, flgBahAtt=False, dimAtt=None):
         super(AttnDecoderRNN, self).__init__()
 
+        self.flgBahAtt = flgBahAtt # Use Bah attention
         self.dimLSTM_dec = dimLSTM_dec
         self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=PAD_IDX)
 
@@ -219,7 +220,11 @@ class AttnDecoderRNN(nn.Module):
             self.embedding.weight = nn.Parameter(embedding, requires_grad=flg_updateEmb)
 
         self.out = nn.Linear(dimLSTM_dec, vocab_size)
-        self.attn = nn.Linear(dimLSTM_dec + emb_dim, dim_enc) # dimLSTM_enc should be the entire encoder output size, so double the size if bi-Directional
+        if self.flgBahAtt:
+            self.attn = nn.Linear(dimLSTM_dec + emb_dim + dim_enc, dimAtt, bias = False) # concat previous decoder hidden and current input, then FF to get weight
+            self.v_att = nn.Linear(dimAtt, 1, bias = False)
+        else:
+            self.attn = nn.Linear(dimLSTM_dec + emb_dim, dim_enc) # dimLSTM_enc should be the entire encoder output size, so double the size if bi-Directional
         self.dropout = nn.Dropout(p=p_dropOut)
 
         self.gru = nn.GRU(dim_enc + emb_dim, self.dimLSTM_dec, batch_first=True)
@@ -232,10 +237,17 @@ class AttnDecoderRNN(nn.Module):
     def forward(self, input, hidden, encoder_outputs):
         # encoder_outputs.shape: batch x seq_len x dimLSTM_enc*2
         # Get the embedding of the current input
+        enc_len = encoder_outputs.shape[1]
         embedded = self.dropout(self.embedding(input)) # Batch x seq_len=1 x emb_dim
         # Get weights from dot product
-        query = self.attn(torch.cat((embedded, hidden.transpose(0,1)), dim=2)) # Batch x seq_len=1 x dim_enc
-        attn_weights = torch.bmm(query, encoder_outputs.transpose(1, 2)) # Batch x 1 x seq_len_enc
+        if self.flgBahAtt:
+            query = torch.cat((embedded, hidden.transpose(0,1)), dim=2)
+            query = torch.cat((query.repeat(1,enc_len, 1), encoder_outputs), dim = 2)  # batch x seq_len x all_dim
+            attn_weights = self.v_att(F.tanh(self.attn(query))) # batch x seq_len x 1
+            attn_weights = attn_weights.transpose(1,2)
+        else:
+            query = self.attn(torch.cat((embedded, hidden.transpose(0,1)), dim=2)) # Batch x seq_len=1 x dim_enc
+            attn_weights = torch.bmm(query, encoder_outputs.transpose(1, 2)) # Batch x 1 x seq_len_enc
 
         # Softmax to normalize
         attn_weights = F.softmax(attn_weights, dim = 2) # Batch x 1 x seq_len_enc
@@ -261,7 +273,9 @@ class AttRNNseq2seq(nn.Module):
         self.model_paras = model_paras
         self.flg_cuda = torch.cuda.is_available()
         self.device = torch.device("cuda" if self.flg_cuda else "cpu")
+        self.flgBahAtt = model_paras.get('flgBahAtt', False)
         self.teacher_forcing_ratio = model_paras.get('teacher_forcing_ratio', 0.0)
+        self.dimAtt = model_paras.get('dimAtt', None)
 
         vocab_size_enc = model_paras.get('vocab_size_enc', 100000)
         self.vocab_size_dec = model_paras.get('vocab_size_dec', 100000)
@@ -279,7 +293,7 @@ class AttRNNseq2seq(nn.Module):
         p_dropOut = model_paras.get('p_dropOut', 0.5)
 
         self.encoder = EncoderRNN(data_emb, dimLSTM_enc, nLSTM_enc, vocab_size_enc, emb_dim_enc, flg_bidirectional_enc, p_dropOut, flg_updateEmb)
-        self.decoder = AttnDecoderRNN(target_emb, dimLSTM_enc*2, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb) # Assume encoder is bi-directional
+        self.decoder = AttnDecoderRNN(target_emb, dimLSTM_enc*2, dimLSTM_dec, self.vocab_size_dec, emb_dim_dec, p_dropOut, flg_updateEmb, self.flgBahAtt, self.dimAtt) # Assume encoder is bi-directional
 
         self.params = self.encoder.params + self.decoder.params
 
@@ -665,7 +679,8 @@ class trainModel(object):
             self.optimizer.zero_grad()
             output, idx, mask, att_weights = self.model(data, target, data_len, target_len)
             loss = self.criterion(output.transpose(1,2), target)
-            loss = (loss * mask).sum() / mask.sum()
+            #loss = (loss * mask).sum() / mask.sum()
+            loss = (loss * mask).sum() / data.size()[0]
             loss.backward()
             self.optimizer.step()
 
@@ -703,8 +718,10 @@ class trainModel(object):
                 with torch.no_grad():
                     output, idx, mask, att_weights = self.model.inference(data, target, data_len, target_len)
                     test_loss_step = self.criterion(output.transpose(1, 2), target)
-                    test_loss_step = (test_loss_step * mask).sum() / mask.sum()
-                    test_loss += test_loss_step * data.size()[0]
+                    #test_loss_step = (test_loss_step * mask).sum() / mask.sum()
+                    test_loss_step = (test_loss_step * mask).sum()
+                    #test_loss += test_loss_step * data.size()[0]
+                    test_loss += test_loss_step
 
                 pred_txt = self._idx2words(idx.data.cpu().numpy().astype(int))
                 self.pred.extend(pred_txt)
