@@ -196,7 +196,7 @@ class RNNseq2seq(nn.Module):
             for i in range(batchSize):
                 for j in range(max_length):
                     if decoder_idx[i][j].item() == EOS_IDX:
-                        mask[i,j:] = 0
+                        mask[i,(j+1):] = 0
         if self.flg_cuda:
             mask = mask.cuda()
         return decoder_output, decoder_idx, mask, []
@@ -326,10 +326,11 @@ class AttRNNseq2seq(nn.Module):
 
             # Create a mask, set value to 0 for tokens generated after the first EOS_IDX. Modify loss calculation during training
         decoder_idx = torch.cat(decoder_idx, 1)
-        for i in range(batchSize):
-            for j in range(max_length):
-                if decoder_idx[i][j].item() == EOS_IDX:
-                    mask[i,j:] = 0
+        if not use_teacher_forcing:
+            for i in range(batchSize):
+                for j in range(max_length):
+                    if decoder_idx[i][j].item() == EOS_IDX:
+                        mask[i,(j+1):] = 0
         if self.flg_cuda:
             mask = mask.cuda()
         return decoder_output, decoder_idx, mask, att_weights
@@ -582,10 +583,11 @@ class SelfAttEncRNNDec(nn.Module):
 
             # Create a mask, set value to 0 for tokens generated after the first EOS_IDX. Modify loss calculation during training
         decoder_idx = torch.cat(decoder_idx, 1)
-        for i in range(batchSize):
-            for j in range(max_length):
-                if decoder_idx[i][j].item() == EOS_IDX:
-                    mask[i,j:] = 0
+        if not use_teacher_forcing:
+            for i in range(batchSize):
+                for j in range(max_length):
+                    if decoder_idx[i][j].item() == EOS_IDX:
+                        mask[i,(j+1):] = 0
         if self.flg_cuda:
             mask = mask.cuda()
         return decoder_output, decoder_idx, mask, att_weights
