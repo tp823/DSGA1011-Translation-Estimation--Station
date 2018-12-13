@@ -749,9 +749,12 @@ class trainModel(object):
         Provide a single prediction example
         '''
         i = np.random.choice(len(self.pred))
-        print('Dev sample: ', i)
-        print('Reference: ', ' '.join(self.target[i]))
-        print('Prediction: ', ' '.join(self.pred[i]))
+        try:
+            print('Dev sample: ', i)
+            print('Reference: ', ' '.join(self.target[i]))
+            print('Prediction: ', ' '.join(self.pred[i]))
+        except:
+            pass
 
     def _saveModel(self):
         torch.save(self.model, self.savePath + '_model.pt')
