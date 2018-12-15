@@ -1,0 +1,22 @@
+General parameters:  Namespace(batchSize=32, dataLang='vi', dataLength=50, dimFF=256, dimLSTM_dec=1024, dimLSTM_enc=1024, emb_dim_data=300, emb_dim_target=300, flgNoPretrain=False, flg_bidirectional_enc=False, flg_initAvg=False, flg_updateEmb=False, i=1, inputPath='../project_data/model_input/en-vi_v100K_emb300K/', logInterval=1, lr=0.001, lr_decay3=5, lr_decay_rate=0.9, modelName='RNNseq2seq', modelPath='../model/rnn-vi-top-model/', nHead=6, nLSTM_enc=1, nStack=2, n_batch=1, n_iter=10, num_workers=4, optType='Adam', p_dropOut=0.5, randSeed=42, targetLang='en', targetLength=50, teacher_forcing_ratio=0.5, vocab_size_data=100000, vocab_size_target=100000)
+Load data: 
+To Loader
+Loading model
+RNNseq2seq(
+  (encoder): EncoderRNN(
+    (embedding): Embedding(35530, 300, padding_idx=0)
+    (gru): GRU(300, 1024, batch_first=True, dropout=0.5)
+    (dropout): Dropout(p=0.5)
+  )
+  (decoder): DecoderRNN(
+    (embedding): Embedding(47862, 300, padding_idx=0)
+    (dropout): Dropout(p=0.5)
+    (gru): GRU(1324, 1024, batch_first=True)
+    (out): Linear(in_features=1024, out_features=47862, bias=True)
+    (softmax): LogSoftmax()
+  )
+)
+Test set: Average loss: 167.8390, Bleu: 10.8943
+Dev sample:  1126
+Reference:  the more it changes , the faster it changes .
+Prediction:  the process of the changing speed , the more it changes .
