@@ -93,7 +93,6 @@ if __name__ == '__main__':
     print("Loading model")
     if flg_cuda:
         model0 = torch.load(args.modelPath + '_model.pt')
-        model0 = model0.cuda()
     else:
         model0 = torch.load(args.modelPath + '_model.pt', map_location=lambda storage, loc: storage)
 
@@ -103,6 +102,8 @@ if __name__ == '__main__':
         model.load_state_dict(model0.state_dict())
 
     print(model)
+    if flg_cuda:
+        model = model.cuda()
 
     opt = optim.Adam(model.params, lr=args.lr)
 
